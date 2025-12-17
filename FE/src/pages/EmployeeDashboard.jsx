@@ -32,6 +32,7 @@ export default function EmployeeDashboard() {
   const [plans, setPlans] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [materials, setMaterials] = useState([]);
+  const [calls, setCalls] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -89,6 +90,8 @@ export default function EmployeeDashboard() {
       if (tabKey === 'plan') {
         const res = await apiGet(`/coaching-plans?client_id=${encodeURIComponent(cid)}${employeeFilter}`);
         setPlans(res?.items || []);
+        const callRes = await apiGet(`/calls?client_id=${encodeURIComponent(cid)}${employeeFilter}`);
+        setCalls(callRes?.items || []);
       } else if (tabKey === 'sessions') {
         const res = await apiGet(`/coaching-sessions?client_id=${encodeURIComponent(cid)}${employeeFilter}`);
         setSessions(res?.items || []);
@@ -103,51 +106,64 @@ export default function EmployeeDashboard() {
     }
   }
 
-  const summary = useMemo(() => {
+  const planData = useMemo(() => {
     const plan = plans[0] || null;
-    const focus = plan?.plan?.focus_areas || [];
-    const actionItems = plan?.plan?.action_items || [];
-    return { plan, focus, actionItems };
-  }, [plans]);
+    const items = plan?.items || [];
+    const grouped = items.reduce((acc, item) => {
+      const key = item.source_kb_id || 'unknown';
+      const list = acc[key] || [];
+      list.push(item);
+      acc[key] = list;
+      return acc;
+    }, {});
+    const callMap = Object.fromEntries((calls || []).map((c) => [c.id, c.created_at]));
+    return { plan, grouped, callMap };
+  }, [plans, calls]);
 
   function renderPlan() {
     if (!clientId) return <div className="empty">Choose a client to view your plan.</div>;
     if (loading) return <div className="muted">Loading…</div>;
     if (error) return <div className="error-text">{error}</div>;
     if (!plans.length) return <div className="empty">No coaching plan yet.</div>;
+    const plan = planData.plan;
+    const grouped = planData.grouped;
+    const callMap = planData.callMap;
+    const schedule = {
+      duration: plan?.duration_minutes || 0,
+      perWeek: plan?.sessions_per_week || 0,
+      weeks: plan?.weeks || 0,
+    };
     return (
       <div className="list-stack panel-scroll">
         <div className="list-card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div style={{ fontWeight: 700 }}>Latest plan</div>
-            <div className="pill-badge">{formatDate(plans[0]?.created_at)}</div>
+            <div className="pill-badge">{formatDate(plan?.created_at)}</div>
           </div>
-          {summary.plan?.plan?.summary && <div className="muted">{summary.plan.plan.summary}</div>}
-          {summary.focus.length > 0 && (
-            <div>
-              <div className="panel-title" style={{ fontSize: 15, marginBottom: 6 }}>Focus areas</div>
+          <div className="muted">Sessions: {schedule.perWeek}/week for {schedule.weeks} weeks · {schedule.duration || 0} minutes</div>
+          {Object.keys(grouped).length === 0 && <div className="empty">No improvement items yet.</div>}
+          {Object.entries(grouped).map(([kb, items]) => (
+            <div key={kb} style={{ marginTop: 12 }}>
+              <div className="panel-title" style={{ fontSize: 15, marginBottom: 6 }}>KB: {items[0]?.source_kb_name || kb}</div>
               <div className="list-stack">
-                {summary.focus.map((f, idx) => (
-                  <div key={idx} className="list-card">
-                    <div style={{ fontWeight: 700 }}>{f.title || `Area ${idx + 1}`}</div>
-                    {f.detail && <div className="muted">{f.detail}</div>}
+                {items.map((it) => (
+                  <div key={it.id} className="list-card">
+                    <div style={{ fontWeight: 700 }}>{it.area}</div>
+                    {it.why_it_matters && <div className="muted">{it.why_it_matters}</div>}
+                    <div className="tag-row">
+                      {Array.isArray(it.drills) && it.drills.slice(0, 3).map((d, idx) => (
+                        <span key={idx} className="pill-badge">{d}</span>
+                      ))}
+                    </div>
+                    {Array.isArray(it.evidence) && it.evidence.length > 0 && (
+                      <div className="muted">Evidence: {it.evidence.join('; ')}</div>
+                    )}
+                    <div className="muted">Call: {it.source_call_id ? formatDate(callMap[it.source_call_id]) : 'n/a'}</div>
                   </div>
                 ))}
               </div>
             </div>
-          )}
-          {summary.actionItems.length > 0 && (
-            <div>
-              <div className="panel-title" style={{ fontSize: 15, marginTop: 10, marginBottom: 6 }}>Action items</div>
-              <ul style={{ margin: 0, paddingLeft: 18, color: '#dce6ff' }}>
-                {summary.actionItems.map((a, idx) => (
-                  <li key={idx} style={{ marginBottom: 4 }}>
-                    {typeof a === 'string' ? a : JSON.stringify(a)}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+          ))}
         </div>
       </div>
     );
@@ -158,9 +174,14 @@ export default function EmployeeDashboard() {
     if (loading) return <div className="muted">Loading…</div>;
     if (error) return <div className="error-text">{error}</div>;
     if (!sessions.length) return <div className="empty">No sessions scheduled.</div>;
+    const now = Date.now();
+    const upcoming = sessions.filter((s) => new Date(s.scheduled_at).getTime() >= now);
+    const past = sessions.filter((s) => new Date(s.scheduled_at).getTime() < now);
     return (
       <div className="list-stack panel-scroll">
-        {sessions.map((s) => (
+        <div className="panel-title" style={{ fontSize: 15 }}>Upcoming</div>
+        {upcoming.length === 0 && <div className="muted">No upcoming sessions.</div>}
+        {upcoming.map((s) => (
           <div key={s.id} className="list-card">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ fontWeight: 700 }}>{s.channel || 'Session'}</div>
@@ -169,6 +190,21 @@ export default function EmployeeDashboard() {
             <div className="tag-row">
               <span className="pill-badge">{(s.duration_minutes || 0) + ' min'}</span>
               <span className="pill-badge">{s.status || 'scheduled'}</span>
+            </div>
+            {s.notes && <div className="muted">{s.notes}</div>}
+          </div>
+        ))}
+        <div className="panel-title" style={{ fontSize: 15, marginTop: 10 }}>Past</div>
+        {past.length === 0 && <div className="muted">No past sessions.</div>}
+        {past.map((s) => (
+          <div key={s.id} className="list-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontWeight: 700 }}>{s.channel || 'Session'}</div>
+              <div className="pill-badge">{formatDate(s.scheduled_at)}</div>
+            </div>
+            <div className="tag-row">
+              <span className="pill-badge">{(s.duration_minutes || 0) + ' min'}</span>
+              <span className="pill-badge">{s.status || 'done'}</span>
             </div>
             {s.notes && <div className="muted">{s.notes}</div>}
           </div>

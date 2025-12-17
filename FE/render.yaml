@@ -17,7 +17,7 @@ services:
       # keep these managed in the Render UI; don't let blueprint overwrite
       - key: VITE_SUPABASE_URL
         sync: false
-      - key: VITE_SUPABASE_ANON_KEY
+      - key: VITE_SUPABASE_PUBLIC_ANON_KEY
         sync: false
 
   # ---- Frontend QA (multipage) ----
@@ -32,7 +32,7 @@ services:
         value: https://ia-backend-qa.onrender.com
       - key: VITE_SUPABASE_URL
         sync: false
-      - key: VITE_SUPABASE_ANON_KEY
+      - key: VITE_SUPABASE_PUBLIC_ANON_KEY
         sync: false
 
   # ---- Frontend STAGING (multipage) ----
@@ -47,5 +47,5 @@ services:
         value: https://ia-backend-staging.onrender.com
       - key: VITE_SUPABASE_URL
         sync: false
-      - key: VITE_SUPABASE_ANON_KEY
+      - key: VITE_SUPABASE_PUBLIC_ANON_KEY
         sync: false

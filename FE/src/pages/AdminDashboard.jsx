@@ -38,7 +38,7 @@ export default function AdminDashboard() {
 
   const [employeeForm, setEmployeeForm] = useState({ name: '', email: '', title: '' });
   const [kbForm, setKbForm] = useState({ title: '', description: '', source_url: '' });
-  const [callForm, setCallForm] = useState({ employee_id: '', recording_url: '', transcript_url: '' });
+  const [callForm, setCallForm] = useState({ employee_id: '', kb_id: '', transcript_text: '', recording_url: '' });
   const [sessionForm, setSessionForm] = useState({
     employee_id: '',
     scheduled_at: '',
@@ -150,10 +150,23 @@ export default function AdminDashboard() {
     setError('');
     try {
       await apiPost('/calls', { ...callForm, client_id: clientId });
-      setCallForm({ employee_id: '', recording_url: '', transcript_url: '' });
+      setCallForm({ employee_id: '', kb_id: '', transcript_text: '', recording_url: '' });
       refreshTab('calls', clientId);
     } catch (err) {
       setError(err?.message || 'Could not log call');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function analyzeCall(id) {
+    setSaving(true);
+    setError('');
+    try {
+      await apiPost(`/calls/${id}/analyze`, {});
+      refreshTab('calls', clientId);
+    } catch (err) {
+      setError(err?.message || 'Analyze failed');
     } finally {
       setSaving(false);
     }
@@ -257,15 +270,35 @@ export default function AdminDashboard() {
               </select>
             </div>
             <div style={{ display: 'grid', gap: 6 }}>
-              <label>Recording URL</label>
-              <input className="input" value={callForm.recording_url} onChange={(e) => setCallForm((f) => ({ ...f, recording_url: e.target.value }))} />
+              <label>Knowledge Base</label>
+              <select
+                className="input"
+                value={callForm.kb_id}
+                onChange={(e) => setCallForm((f) => ({ ...f, kb_id: e.target.value }))}
+                required
+              >
+                <option value="">Select KB</option>
+                {knowledgeBases.map((kb) => (
+                  <option key={kb.id} value={kb.id}>
+                    {kb.title || kb.name || kb.id}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
-          <div className="field-grid">
-            <div style={{ display: 'grid', gap: 6 }}>
-              <label>Transcript URL</label>
-              <input className="input" value={callForm.transcript_url} onChange={(e) => setCallForm((f) => ({ ...f, transcript_url: e.target.value }))} />
-            </div>
+          <div style={{ display: 'grid', gap: 6 }}>
+            <label>Transcript</label>
+            <textarea
+              className="input"
+              style={{ minHeight: 120, resize: 'vertical' }}
+              value={callForm.transcript_text}
+              onChange={(e) => setCallForm((f) => ({ ...f, transcript_text: e.target.value }))}
+              required
+            />
+          </div>
+          <div style={{ display: 'grid', gap: 6 }}>
+            <label>Recording URL (optional)</label>
+            <input className="input" value={callForm.recording_url} onChange={(e) => setCallForm((f) => ({ ...f, recording_url: e.target.value }))} />
           </div>
           <div className="button-row">
             <button type="submit" className="primary-btn" disabled={saving}>{saving ? 'Saving…' : 'Log call'}</button>
@@ -402,17 +435,17 @@ export default function AdminDashboard() {
                 <div className="pill-badge">{formatDate(c.created_at)}</div>
               </div>
               <div className="muted">Employee: {c.employee_id || 'n/a'}</div>
+              <div className="muted">KB: {c.kb_id || 'n/a'}</div>
+              <div className="muted">Transcript: {(c.transcript_text || '').slice(0, 120)}{(c.transcript_text || '').length > 120 ? '…' : ''}</div>
               <div className="tag-row">
                 {c.recording_url && (
                   <a className="pill" href={c.recording_url} target="_blank" rel="noreferrer">
                     Recording
                   </a>
                 )}
-                {c.transcript_url && (
-                  <a className="pill" href={c.transcript_url} target="_blank" rel="noreferrer">
-                    Transcript
-                  </a>
-                )}
+                <button className="primary-btn" onClick={() => analyzeCall(c.id)} disabled={saving}>
+                  Analyze & Generate Plan
+                </button>
               </div>
             </div>
           ))}

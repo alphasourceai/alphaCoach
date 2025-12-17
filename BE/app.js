@@ -6,6 +6,66 @@ const cors = require('cors');
 const crypto = require('crypto');
 const OpenAI = require('openai');
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient');
+const { query: pgQuery } = (() => {
+  try { return require('./utils/pg'); } catch (_) { return {}; }
+})();
+
+const tableColumns = new Map();
+
+function columnExists(table, column) {
+  const cols = tableColumns.get(table);
+  return cols ? cols.has(column) : false;
+}
+
+async function loadSchemaInfo() {
+  if (typeof pgQuery !== 'function') {
+    console.warn('[schema-check] skipped (no direct DB connection available)');
+    return;
+  }
+  try {
+    const { rows } = await pgQuery(
+      `
+        select table_name, column_name
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name in (
+            'employees',
+            'knowledge_bases',
+            'coaching_sessions',
+            'coaching_plans',
+            'coaching_plan_items',
+            'calls',
+            'call_analyses'
+          )
+      `
+    );
+    tableColumns.clear();
+    for (const row of rows || []) {
+      if (!tableColumns.has(row.table_name)) tableColumns.set(row.table_name, new Set());
+      tableColumns.get(row.table_name).add(row.column_name);
+    }
+    const desired = {
+      employees: ['role', 'title'],
+      knowledge_bases: ['title'],
+      coaching_sessions: ['channel', 'artifacts', 'scheduled_for', 'scheduled_at'],
+      coaching_plans: ['source_analysis_id', 'duration_minutes', 'sessions_per_week', 'weeks', 'last_analysis_at'],
+      coaching_plan_items: ['area', 'area_norm', 'why_it_matters', 'drills', 'evidence', 'source_kb_id', 'source_call_id'],
+      calls: ['employee_id', 'kb_id', 'transcript_text', 'recording_url', 'client_id'],
+      call_analyses: ['call_id', 'client_id', 'employee_id', 'kb_id', 'raw_output', 'parsed', 'overall_score'],
+    };
+    for (const [table, cols] of Object.entries(desired)) {
+      for (const col of cols) {
+        if (!columnExists(table, col)) {
+          console.warn(`[schema-check] missing column ${table}.${col}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[schema-check] failed to inspect schema', e?.message || e);
+  }
+}
+
+loadSchemaInfo();
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
@@ -202,7 +262,7 @@ async function withClientScope(req, res, next) {
     const { data, error } = await supabaseAdmin
       .from('client_members')
       .select('client_id, role, clients ( name )')
-      .or(`user_id.eq.${req.user.id},user_id_uuid.eq.${req.user.id}`);
+      .eq('user_id', req.user.id);
     if (error) return sendError(res, 500, { error: 'membership_lookup_failed', detail: error.message, code: error.code, hint: error.hint });
     req.clientIds = (data || []).map((r) => r.client_id);
     req.memberships =
@@ -247,41 +307,59 @@ function pickClientId(req, fallbackIds) {
   return null;
 }
 
-async function runCallAnalysis(transcript) {
+async function runCallAnalysis(transcript, kbText) {
   const trimmed = (transcript || '').trim();
   const fallback = {
-    summary: trimmed ? trimmed.slice(0, 320) : '',
+    overall_score: null,
     strengths: [],
-    improvements: [],
-    action_items: [],
+    improvement_areas: [],
+    kb_alignment: [],
+    recommended_schedule: { duration_minutes: 30, sessions_per_week: 1, weeks: 4 },
+    next_session_plan: { agenda: [], roleplay: [], homework: [] },
   };
-  if (!openai || !trimmed) return fallback;
+  if (!openai || !trimmed) return { raw: '', parsed: fallback };
   try {
-    const prompt = [
-      'You are a coaching quality analyst.',
-      'Summarize the call and list strengths, improvements, and action items as JSON.',
-      'Respond with keys: summary, strengths (array), improvements (array), action_items (array).',
-    ].join(' ');
+    const system = [
+      'You are an AI coach. Produce only the JSON object matching this schema:',
+      JSON.stringify({
+        overall_score: 0,
+        strengths: ['string'],
+        improvement_areas: [{ area: 'string', evidence: ['string'], why_it_matters: 'string', drills: ['string'] }],
+        kb_alignment: [{ kb_item: 'string', status: 'met|missed|partial', evidence: ['string'] }],
+        recommended_schedule: { duration_minutes: 30, sessions_per_week: 1, weeks: 4 },
+        next_session_plan: { agenda: ['string'], roleplay: ['string'], homework: ['string'] },
+      }),
+      'Use status only from: met, missed, partial. Score 0-100.',
+      'Use the provided knowledge base context to ground improvement_areas and kb_alignment. Return valid JSON only.',
+    ].join('\n');
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
       temperature: 0.1,
       messages: [
-        { role: 'system', content: prompt },
-        { role: 'user', content: trimmed.slice(0, 8000) },
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content: [
+            kbText ? `Knowledge base context:\n${kbText.slice(0, 4000)}` : '',
+            'Transcript:',
+            trimmed.slice(0, 8000),
+          ]
+            .filter(Boolean)
+            .join('\n\n'),
+        },
       ],
       response_format: { type: 'json_object' },
     });
-    const content = completion?.choices?.[0]?.message?.content;
-    if (!content) return fallback;
-    const parsed = JSON.parse(content);
-    return {
-      summary: typeof parsed.summary === 'string' ? parsed.summary : fallback.summary,
-      strengths: Array.isArray(parsed.strengths) ? parsed.strengths : [],
-      improvements: Array.isArray(parsed.improvements) ? parsed.improvements : [],
-      action_items: Array.isArray(parsed.action_items) ? parsed.action_items : [],
-    };
+    const content = completion?.choices?.[0]?.message?.content || '';
+    let parsed = fallback;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      parsed = fallback;
+    }
+    return { raw: content, parsed };
   } catch (e) {
-    return fallback;
+    return { raw: '', parsed: fallback };
   }
 }
 
@@ -301,6 +379,96 @@ function buildPlanFromAnalysis(analysis) {
     action_items: Array.isArray(analysis?.action_items) ? analysis.action_items : [],
   };
   return plan;
+}
+
+function normalizeArea(area) {
+  return (area || '').trim().toLowerCase();
+}
+
+function validatePlanJson(obj) {
+  const err = (detail, hint) => ({ ok: false, detail, hint });
+  if (!obj || typeof obj !== 'object') return err('analysis output missing', 'Expected JSON object');
+  const out = {
+    overall_score: null,
+    strengths: [],
+    improvement_areas: [],
+    kb_alignment: [],
+    recommended_schedule: { duration_minutes: 30, sessions_per_week: 1, weeks: 4 },
+    next_session_plan: { agenda: [], roleplay: [], homework: [] },
+  };
+  if (typeof obj.overall_score === 'number' && isFinite(obj.overall_score)) {
+    out.overall_score = Math.max(0, Math.min(100, obj.overall_score));
+  } else {
+    return err('overall_score missing or invalid', 'Provide numeric 0-100');
+  }
+  if (Array.isArray(obj.strengths)) out.strengths = obj.strengths.filter((s) => typeof s === 'string');
+  if (!Array.isArray(obj.improvement_areas)) return err('improvement_areas missing', 'Provide array of areas');
+  const areas = [];
+  for (const item of obj.improvement_areas) {
+    if (!item || typeof item !== 'object') continue;
+    if (!item.area || typeof item.area !== 'string') continue;
+    const evidence = Array.isArray(item.evidence) ? item.evidence.filter((s) => typeof s === 'string') : [];
+    const drills = Array.isArray(item.drills) ? item.drills.filter((s) => typeof s === 'string') : [];
+    areas.push({
+      area: item.area,
+      evidence,
+      why_it_matters: typeof item.why_it_matters === 'string' ? item.why_it_matters : '',
+      drills,
+    });
+  }
+  if (!areas.length) return err('improvement_areas empty', 'Need at least one area');
+  out.improvement_areas = areas;
+  if (Array.isArray(obj.kb_alignment)) {
+    out.kb_alignment = obj.kb_alignment
+      .filter(
+        (k) =>
+          k &&
+          typeof k === 'object' &&
+          typeof k.kb_item === 'string' &&
+          ['met', 'missed', 'partial'].includes(String(k.status || '').toLowerCase())
+      )
+      .map((k) => ({
+        kb_item: k.kb_item,
+        status: String(k.status).toLowerCase(),
+        evidence: Array.isArray(k.evidence) ? k.evidence.filter((s) => typeof s === 'string') : [],
+      }));
+  }
+  const sched = obj.recommended_schedule || {};
+  const dur = Number(sched.duration_minutes);
+  const spw = Number(sched.sessions_per_week);
+  const wks = Number(sched.weeks);
+  if ([30, 45, 60].includes(dur)) out.recommended_schedule.duration_minutes = dur;
+  if ([0, 1, 2].includes(spw)) out.recommended_schedule.sessions_per_week = spw;
+  if (Number.isInteger(wks) && wks >= 1 && wks <= 8) out.recommended_schedule.weeks = wks;
+  const nsp = obj.next_session_plan || {};
+  if (Array.isArray(nsp.agenda)) out.next_session_plan.agenda = nsp.agenda.filter((s) => typeof s === 'string');
+  if (Array.isArray(nsp.roleplay)) out.next_session_plan.roleplay = nsp.roleplay.filter((s) => typeof s === 'string');
+  if (Array.isArray(nsp.homework)) out.next_session_plan.homework = nsp.homework.filter((s) => typeof s === 'string');
+  return { ok: true, data: out };
+}
+
+function nextWeekday(base, targetDow) {
+  const d = new Date(base.getTime());
+  const diff = (targetDow + 7 - d.getDay()) % 7 || 7;
+  d.setDate(d.getDate() + diff);
+  d.setHours(15, 0, 0, 0);
+  return d;
+}
+
+function generateSessions(perWeek, weeks) {
+  const dates = [];
+  const start = new Date();
+  for (let w = 0; w < weeks; w++) {
+    if (perWeek === 2) {
+      const tue = nextWeekday(new Date(start.getTime() + w * 7 * 24 * 3600 * 1000), 2);
+      const thu = nextWeekday(new Date(start.getTime() + w * 7 * 24 * 3600 * 1000), 4);
+      dates.push(tue, thu);
+    } else if (perWeek === 1) {
+      const wed = nextWeekday(new Date(start.getTime() + w * 7 * 24 * 3600 * 1000), 3);
+      dates.push(wed);
+    }
+  }
+  return dates;
 }
 
 app.get('/health', (_req, res) => ok(res, { ok: true, service: 'alphaCoach' }));
@@ -332,15 +500,24 @@ app.get('/employees', requireAuth, withClientScope, async (req, res) => {
   try {
     const allowed = resolveClientIds(req, req.query.client_id);
     if (!allowed.length) return ok(res, { items: [] });
-    let query = supabaseAdmin
-      .from('employees')
-      .select('id,client_id,name,email,title,role,improvement_areas,created_at')
-      .in('client_id', allowed)
-      .order('created_at', { ascending: false });
+    const cols = ['id', 'client_id', 'name', 'email', 'improvement_areas', 'created_at'];
+    if (columnExists('employees', 'title')) cols.push('title');
+    if (columnExists('employees', 'role')) cols.push('role');
+    let query = supabaseAdmin.from('employees').select(cols.join(',')).in('client_id', allowed).order('created_at', { ascending: false });
     if (req.query.employee_id) query = query.eq('id', req.query.employee_id);
     const { data, error } = await query;
     if (error) return sendError(res, 500, { error: 'employees_fetch_failed', detail: error.message, code: error.code, hint: error.hint });
-    return ok(res, { items: data || [] });
+    const items = (data || []).map((row) => ({
+      id: row.id,
+      client_id: row.client_id,
+      name: row.name,
+      email: row.email,
+      improvement_areas: row.improvement_areas || null,
+      created_at: row.created_at,
+      title: columnExists('employees', 'title') ? row.title || null : null,
+      role: columnExists('employees', 'role') ? row.role || null : null,
+    }));
+    return ok(res, { items });
   } catch (e) {
     return sendError(res, 500, { error: 'server_error', detail: e?.message || 'Unexpected error' });
   }
@@ -359,10 +536,10 @@ app.post('/employees', requireAuth, withClientScope, async (req, res) => {
       client_id,
       name: String(name || '').trim(),
       email: String(email || '').trim(),
-      role: role || 'employee',
-      title: title ? String(title).trim() : null,
       improvement_areas: improvement_areas || null,
     };
+    if (columnExists('employees', 'role')) payload.role = role || 'employee';
+    if (columnExists('employees', 'title')) payload.title = title ? String(title).trim() : null;
     const { data, error } = await supabaseAdmin.from('employees').insert(payload).select().single();
     if (error) return sendError(res, 500, { error: 'employee_create_failed', detail: error.message, code: error.code, hint: error.hint });
     return ok(res, { item: data });
@@ -374,13 +551,24 @@ app.post('/employees', requireAuth, withClientScope, async (req, res) => {
 async function listKnowledgeBases(req, res) {
   const allowed = resolveClientIds(req, req.query.client_id);
   if (!allowed.length) return ok(res, { items: [] });
-  const { data, error } = await supabaseAdmin
-    .from('knowledge_bases')
-    .select('id,client_id,title,description,source_url,tags,created_at')
-    .in('client_id', allowed)
-    .order('created_at', { ascending: false });
+  const cols = ['id', 'client_id', 'created_at'];
+  if (columnExists('knowledge_bases', 'description')) cols.push('description');
+  if (columnExists('knowledge_bases', 'source_url')) cols.push('source_url');
+  if (columnExists('knowledge_bases', 'tags')) cols.push('tags');
+  if (columnExists('knowledge_bases', 'title')) cols.push('title');
+  if (!columnExists('knowledge_bases', 'title') && columnExists('knowledge_bases', 'name')) cols.push('name');
+  const { data, error } = await supabaseAdmin.from('knowledge_bases').select(cols.join(',')).in('client_id', allowed).order('created_at', { ascending: false });
   if (error) return sendError(res, 500, { error: 'knowledge_bases_fetch_failed', detail: error.message, code: error.code, hint: error.hint });
-  return ok(res, { items: data || [] });
+  const items = (data || []).map((row) => ({
+    id: row.id,
+    client_id: row.client_id,
+    description: row.description || null,
+    source_url: row.source_url || null,
+    tags: row.tags || [],
+    created_at: row.created_at,
+    title: columnExists('knowledge_bases', 'title') ? row.title || null : (row.name || null),
+  }));
+  return ok(res, { items });
 }
 
 app.get('/roles', requireAuth, withClientScope, (req, res) => {
@@ -400,14 +588,13 @@ app.post('/knowledge-bases', requireAuth, withClientScope, async (req, res) => {
     if (!hasManagerAccess(req, client_id)) {
       return sendError(res, 403, { error: 'forbidden', detail: 'Insufficient permissions' });
     }
-    const payload = {
-      client_id,
-      title: String(title || '').trim(),
-      description: description ? String(description).trim() : null,
-      source_url: source_url ? String(source_url).trim() : null,
-      tags: Array.isArray(tags) ? tags : [],
-      metadata: metadata || {},
-    };
+    const payload = { client_id };
+    if (columnExists('knowledge_bases', 'title')) payload.title = String(title || '').trim();
+    else if (columnExists('knowledge_bases', 'name')) payload.name = String(title || '').trim();
+    if (columnExists('knowledge_bases', 'description')) payload.description = description ? String(description).trim() : null;
+    if (columnExists('knowledge_bases', 'source_url')) payload.source_url = source_url ? String(source_url).trim() : null;
+    if (columnExists('knowledge_bases', 'tags')) payload.tags = Array.isArray(tags) ? tags : [];
+    if (columnExists('knowledge_bases', 'metadata')) payload.metadata = metadata || {};
     const { data, error } = await supabaseAdmin.from('knowledge_bases').insert(payload).select().single();
     if (error) return sendError(res, 500, { error: 'knowledge_base_create_failed', detail: error.message, code: error.code, hint: error.hint });
     return ok(res, { item: data });
@@ -418,22 +605,17 @@ app.post('/knowledge-bases', requireAuth, withClientScope, async (req, res) => {
 
 app.post('/calls', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { client_id, employee_id, recording_url, transcript_url, transcript_text, notes } = req.body || {};
-    if (!client_id || !employee_id) {
-      return sendError(res, 400, { error: 'invalid_payload', detail: 'client_id and employee_id are required' });
+    const { client_id, employee_id, kb_id, transcript_text, recording_url } = req.body || {};
+    if (!client_id || !employee_id || !kb_id || !transcript_text) {
+      return sendError(res, 400, { error: 'invalid_payload', detail: 'client_id, employee_id, kb_id, transcript_text are required' });
     }
     const allowed = resolveClientIds(req, client_id);
     if (!allowed.includes(client_id)) return sendError(res, 403, { error: 'forbidden', detail: 'Client not permitted' });
-    const payload = {
-      client_id,
-      employee_id,
-      recording_url: recording_url || null,
-      transcript_url: transcript_url || null,
-      transcript_text: transcript_text || null,
-      notes: notes || null,
-      status: 'uploaded',
-    };
-    const { data, error } = await supabaseAdmin.from('call_sessions').insert(payload).select().single();
+    const payload = { client_id, employee_id, kb_id };
+    if (columnExists('calls', 'transcript_text')) payload.transcript_text = transcript_text;
+    if (columnExists('calls', 'recording_url')) payload.recording_url = recording_url || null;
+    payload.created_at = new Date().toISOString();
+    const { data, error } = await supabaseAdmin.from('calls').insert(payload).select().single();
     if (error) return sendError(res, 500, { error: 'call_create_failed', detail: error.message, code: error.code, hint: error.hint });
     return ok(res, { item: data });
   } catch (e) {
@@ -445,15 +627,23 @@ app.get('/calls', requireAuth, withClientScope, async (req, res) => {
   try {
     const allowed = resolveClientIds(req, req.query.client_id);
     if (!allowed.length) return ok(res, { items: [] });
-    let query = supabaseAdmin
-      .from('call_sessions')
-      .select('id,client_id,employee_id,recording_url,transcript_url,transcript_text,status,created_at')
-      .in('client_id', allowed)
-      .order('created_at', { ascending: false });
+    const cols = ['id', 'client_id', 'employee_id', 'kb_id', 'created_at'];
+    if (columnExists('calls', 'transcript_text')) cols.push('transcript_text');
+    if (columnExists('calls', 'recording_url')) cols.push('recording_url');
+    let query = supabaseAdmin.from('calls').select(cols.join(',')).in('client_id', allowed).order('created_at', { ascending: false });
     if (req.query.employee_id) query = query.eq('employee_id', req.query.employee_id);
     const { data, error } = await query;
     if (error) return sendError(res, 500, { error: 'calls_fetch_failed', detail: error.message, code: error.code, hint: error.hint });
-    return ok(res, { items: data || [] });
+    const items = (data || []).map((row) => ({
+      id: row.id,
+      client_id: row.client_id,
+      employee_id: row.employee_id,
+      kb_id: row.kb_id || null,
+      created_at: row.created_at,
+      transcript_text: columnExists('calls', 'transcript_text') ? row.transcript_text || '' : '',
+      recording_url: columnExists('calls', 'recording_url') ? row.recording_url || null : null,
+    }));
+    return ok(res, { items });
   } catch (e) {
     return sendError(res, 500, { error: 'server_error', detail: e?.message || 'Unexpected error' });
   }
@@ -516,7 +706,7 @@ app.post('/analyze-call', requireAuth, withClientScope, async (req, res) => {
         employee_id: targetEmployeeId,
         call_session_id: call_session_id || null,
         plan,
-        source_analysis_id: analysisRow?.id || null,
+        ...(columnExists('coaching_plans', 'source_analysis_id') ? { source_analysis_id: analysisRow?.id || null } : {}),
       })
       .select()
       .single();
@@ -530,19 +720,255 @@ app.post('/analyze-call', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+app.post('/calls/:id/analyze', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id;
+  try {
+    const callId = req.params.id;
+    if (!callId) return sendError(res, 400, { error: 'invalid_payload', detail: 'call id required' });
+    const callCols = ['id', 'client_id', 'employee_id', 'kb_id', 'created_at'];
+    if (columnExists('calls', 'transcript_text')) callCols.push('transcript_text');
+    if (columnExists('calls', 'recording_url')) callCols.push('recording_url');
+    const { data: callRow, error: callErr } = await supabaseAdmin.from('calls').select(callCols.join(',')).eq('id', callId).maybeSingle();
+    if (callErr) return sendError(res, 500, { error: 'call_lookup_failed', detail: callErr.message, code: callErr.code, hint: callErr.hint });
+    if (!callRow) return sendError(res, 404, { error: 'not_found', detail: 'Call not found' });
+    if (!resolveClientIds(req, callRow.client_id).includes(callRow.client_id)) return sendError(res, 403, { error: 'forbidden', detail: 'Client not permitted' });
+    if (!callRow.employee_id || !callRow.kb_id) return sendError(res, 400, { error: 'invalid_call', detail: 'Call missing employee or knowledge base' });
+    const transcriptText = columnExists('calls', 'transcript_text') ? callRow.transcript_text || '' : '';
+    if (!transcriptText.trim()) return sendError(res, 400, { error: 'invalid_call', detail: 'Transcript missing for call' });
+
+    const kbCols = ['id'];
+    if (columnExists('knowledge_bases', 'title')) kbCols.push('title');
+    if (columnExists('knowledge_bases', 'description')) kbCols.push('description');
+    if (columnExists('knowledge_bases', 'tags')) kbCols.push('tags');
+    if (columnExists('knowledge_bases', 'metadata')) kbCols.push('metadata');
+    const { data: kbRow, error: kbErr } = await supabaseAdmin.from('knowledge_bases').select(kbCols.join(',')).eq('id', callRow.kb_id).maybeSingle();
+    if (kbErr) return sendError(res, 500, { error: 'kb_lookup_failed', detail: kbErr.message, code: kbErr.code, hint: kbErr.hint });
+    if (!kbRow) return sendError(res, 400, { error: 'invalid_call', detail: 'Knowledge base not found' });
+    const kbTextParts = [];
+    if (kbRow.title) kbTextParts.push(`Title: ${kbRow.title}`);
+    if (kbRow.description) kbTextParts.push(`Description: ${kbRow.description}`);
+    if (Array.isArray(kbRow.tags)) kbTextParts.push(`Tags: ${kbRow.tags.join(', ')}`);
+    const kbText = kbTextParts.join('\n');
+
+    const { raw, parsed } = await runCallAnalysis(transcriptText, kbText);
+    const validation = validatePlanJson(parsed);
+    if (!validation.ok) {
+      return sendError(res, 400, { error: 'invalid_ai_json', code: 'invalid_ai_json', detail: validation.detail, hint: validation.hint });
+    }
+    const planData = validation.data;
+    const nowIso = new Date().toISOString();
+
+    const analysisPayload = {};
+    if (columnExists('call_analyses', 'call_id')) analysisPayload.call_id = callId;
+    if (columnExists('call_analyses', 'client_id')) analysisPayload.client_id = callRow.client_id;
+    if (columnExists('call_analyses', 'employee_id')) analysisPayload.employee_id = callRow.employee_id;
+    if (columnExists('call_analyses', 'kb_id')) analysisPayload.kb_id = callRow.kb_id;
+    if (columnExists('call_analyses', 'raw_output')) analysisPayload.raw_output = raw || JSON.stringify(parsed);
+    if (columnExists('call_analyses', 'parsed')) analysisPayload.parsed = planData;
+    if (columnExists('call_analyses', 'overall_score')) analysisPayload.overall_score = planData.overall_score;
+    const { data: analysisRow, error: analysisErr } = await supabaseAdmin.from('call_analyses').insert(analysisPayload).select().single();
+    if (analysisErr) return sendError(res, 500, { error: 'analysis_save_failed', detail: analysisErr.message, code: analysisErr.code, hint: analysisErr.hint });
+
+    const sched = planData.recommended_schedule || {};
+    const planPayload = {
+      client_id: callRow.client_id,
+      employee_id: callRow.employee_id,
+      updated_at: nowIso,
+      last_analysis_at: nowIso,
+    };
+    if (columnExists('coaching_plans', 'duration_minutes')) planPayload.duration_minutes = sched.duration_minutes || 30;
+    if (columnExists('coaching_plans', 'sessions_per_week')) planPayload.sessions_per_week = sched.sessions_per_week ?? 1;
+    if (columnExists('coaching_plans', 'weeks')) planPayload.weeks = sched.weeks || 4;
+    const { data: planRow, error: planErr } = await supabaseAdmin
+      .from('coaching_plans')
+      .upsert(planPayload, { onConflict: 'employee_id' })
+      .select()
+      .single();
+    if (planErr) return sendError(res, 500, { error: 'plan_save_failed', detail: planErr.message, code: planErr.code, hint: planErr.hint });
+
+    let existingItems = [];
+    if (columnExists('coaching_plan_items', 'employee_id')) {
+      let itemQuery = supabaseAdmin.from('coaching_plan_items').select('id,employee_id,source_kb_id,area,area_norm,plan_id');
+      itemQuery = itemQuery.eq('employee_id', callRow.employee_id);
+      if (columnExists('coaching_plan_items', 'source_kb_id')) itemQuery = itemQuery.eq('source_kb_id', callRow.kb_id);
+      const { data: itemsData } = await itemQuery;
+      existingItems = itemsData || [];
+    }
+
+    const existingMap = new Map();
+    for (const item of existingItems) {
+      const norm = normalizeArea(columnExists('coaching_plan_items', 'area_norm') ? item.area_norm || item.area : item.area);
+      const key = `${norm}::${item.source_kb_id || 'kb'}`;
+      existingMap.set(key, item);
+    }
+
+    const insertedItems = [];
+    for (const area of planData.improvement_areas) {
+      const norm = normalizeArea(area.area);
+      const key = `${norm}::${callRow.kb_id}`;
+      const payload = {
+        client_id: callRow.client_id,
+        employee_id: callRow.employee_id,
+        plan_id: planRow.id,
+      };
+      if (columnExists('coaching_plan_items', 'source_kb_id')) payload.source_kb_id = callRow.kb_id;
+      if (columnExists('coaching_plan_items', 'source_call_id')) payload.source_call_id = callId;
+      if (columnExists('coaching_plan_items', 'area')) payload.area = area.area;
+      if (columnExists('coaching_plan_items', 'area_norm')) payload.area_norm = norm;
+      if (columnExists('coaching_plan_items', 'why_it_matters')) payload.why_it_matters = area.why_it_matters || '';
+      if (columnExists('coaching_plan_items', 'drills')) payload.drills = area.drills || [];
+      if (columnExists('coaching_plan_items', 'evidence')) payload.evidence = area.evidence || [];
+      if (columnExists('coaching_plan_items', 'status')) payload.status = 'open';
+      if (columnExists('coaching_plan_items', 'priority')) payload.priority = 0;
+      if (columnExists('coaching_plan_items', 'last_seen_at')) payload.last_seen_at = nowIso;
+      const existing = existingMap.get(key);
+      if (existing) {
+        const updatePayload = { ...payload };
+        delete updatePayload.client_id;
+        delete updatePayload.employee_id;
+        delete updatePayload.plan_id;
+        const { data: updated } = await supabaseAdmin.from('coaching_plan_items').update(updatePayload).eq('id', existing.id).select().single();
+        if (updated) insertedItems.push(updated);
+      } else {
+        const { data: inserted } = await supabaseAdmin.from('coaching_plan_items').insert(payload).select().single();
+        if (inserted) insertedItems.push(inserted);
+      }
+    }
+
+    const perWeek = planData.recommended_schedule.sessions_per_week || 0;
+    const weeks = planData.recommended_schedule.weeks || 0;
+    const durationMinutes = planData.recommended_schedule.duration_minutes || 30;
+    const sessionDates = perWeek > 0 && weeks > 0 ? generateSessions(perWeek, weeks) : [];
+    const timeField = columnExists('coaching_sessions', 'scheduled_for')
+      ? 'scheduled_for'
+      : columnExists('coaching_sessions', 'scheduled_at')
+      ? 'scheduled_at'
+      : null;
+    const planIdField = columnExists('coaching_sessions', 'plan_id') ? 'plan_id' : null;
+    const newSessions = [];
+    if (timeField && sessionDates.length) {
+      let sessionQuery = supabaseAdmin.from('coaching_sessions').select(`id,${timeField},employee_id`);
+      sessionQuery = sessionQuery.eq('employee_id', callRow.employee_id);
+      sessionQuery = sessionQuery.gte(timeField, new Date().toISOString());
+      const { data: existingSessions } = await sessionQuery;
+      const existingSet = new Set(
+        (existingSessions || []).map((s) => {
+          const d = new Date(s[timeField]);
+          return d.toISOString().slice(0, 10);
+        })
+      );
+      const payloads = [];
+      for (const d of sessionDates) {
+        const dayKey = d.toISOString().slice(0, 10);
+        if (existingSet.has(dayKey)) continue;
+        const p = {
+          client_id: callRow.client_id,
+          employee_id: callRow.employee_id,
+          [timeField]: d.toISOString(),
+        };
+        if (columnExists('coaching_sessions', 'duration_minutes')) p.duration_minutes = durationMinutes;
+        if (columnExists('coaching_sessions', 'status')) p.status = 'scheduled';
+        if (columnExists('coaching_sessions', 'channel')) p.channel = 'virtual';
+        if (columnExists('coaching_sessions', 'artifacts')) p.artifacts = {};
+        if (planIdField) p[planIdField] = planRow.id;
+        payloads.push(p);
+      }
+      if (payloads.length) {
+        const { data: insertedSessions } = await supabaseAdmin.from('coaching_sessions').insert(payloads).select();
+        if (insertedSessions) newSessions.push(...insertedSessions);
+      }
+    }
+
+    return ok(res, {
+      analysis: analysisRow,
+      plan: planRow,
+      plan_items: insertedItems,
+      sessions: newSessions,
+    });
+  } catch (e) {
+    return sendError(res, 500, { error: 'server_error', detail: e?.message || 'Unexpected error', request_id });
+  }
+});
+
 app.get('/coaching-plans', requireAuth, withClientScope, async (req, res) => {
   try {
     const allowed = resolveClientIds(req, req.query.client_id);
     if (!allowed.length) return ok(res, { items: [] });
-    let query = supabaseAdmin
-      .from('coaching_plans')
-      .select('id,client_id,employee_id,call_session_id,plan,source_analysis_id,created_at,updated_at')
-      .in('client_id', allowed)
-      .order('created_at', { ascending: false });
+    const cols = ['id', 'client_id', 'employee_id', 'call_session_id', 'created_at', 'updated_at'];
+    if (columnExists('coaching_plans', 'source_analysis_id')) cols.push('source_analysis_id');
+    if (columnExists('coaching_plans', 'duration_minutes')) cols.push('duration_minutes');
+    if (columnExists('coaching_plans', 'sessions_per_week')) cols.push('sessions_per_week');
+    if (columnExists('coaching_plans', 'weeks')) cols.push('weeks');
+    if (columnExists('coaching_plans', 'last_analysis_at')) cols.push('last_analysis_at');
+    let query = supabaseAdmin.from('coaching_plans').select(cols.join(',')).in('client_id', allowed).order('created_at', { ascending: false });
     if (req.query.employee_id) query = query.eq('employee_id', req.query.employee_id);
     const { data, error } = await query;
     if (error) return sendError(res, 500, { error: 'plans_fetch_failed', detail: error.message, code: error.code, hint: error.hint });
-    return ok(res, { items: data || [] });
+    const planIds = (data || []).map((r) => r.id);
+    let planItemsByPlan = {};
+    if (planIds.length && columnExists('coaching_plan_items', 'plan_id')) {
+      const itemCols = ['id', 'plan_id', 'employee_id', 'client_id'];
+      if (columnExists('coaching_plan_items', 'source_kb_id')) itemCols.push('source_kb_id');
+      if (columnExists('coaching_plan_items', 'source_call_id')) itemCols.push('source_call_id');
+      if (columnExists('coaching_plan_items', 'area')) itemCols.push('area');
+      if (columnExists('coaching_plan_items', 'area_norm')) itemCols.push('area_norm');
+      if (columnExists('coaching_plan_items', 'why_it_matters')) itemCols.push('why_it_matters');
+      if (columnExists('coaching_plan_items', 'drills')) itemCols.push('drills');
+      if (columnExists('coaching_plan_items', 'evidence')) itemCols.push('evidence');
+      if (columnExists('coaching_plan_items', 'status')) itemCols.push('status');
+      if (columnExists('coaching_plan_items', 'priority')) itemCols.push('priority');
+      if (columnExists('coaching_plan_items', 'last_seen_at')) itemCols.push('last_seen_at');
+      const { data: planItems } = await supabaseAdmin.from('coaching_plan_items').select(itemCols.join(',')).in('plan_id', planIds);
+      const kbIds = Array.from(new Set((planItems || []).map((i) => i.source_kb_id).filter(Boolean)));
+      let kbMap = {};
+      if (kbIds.length) {
+        const kbCols = ['id'];
+        if (columnExists('knowledge_bases', 'title')) kbCols.push('title');
+        if (columnExists('knowledge_bases', 'name')) kbCols.push('name');
+        const { data: kbRows } = await supabaseAdmin.from('knowledge_bases').select(kbCols.join(',')).in('id', kbIds);
+        kbMap = Object.fromEntries(
+          (kbRows || []).map((k) => [k.id, k.title || k.name || null])
+        );
+      }
+      planItemsByPlan = (planItems || []).reduce((acc, item) => {
+        const list = acc[item.plan_id] || [];
+        list.push({
+          id: item.id,
+          plan_id: item.plan_id,
+          employee_id: item.employee_id,
+          client_id: item.client_id,
+          source_kb_id: item.source_kb_id || null,
+          source_kb_name: item.source_kb_id ? kbMap[item.source_kb_id] || null : null,
+          source_call_id: item.source_call_id || null,
+          area: item.area || null,
+          area_norm: item.area_norm || null,
+          why_it_matters: item.why_it_matters || null,
+          drills: item.drills || [],
+          evidence: item.evidence || [],
+          status: item.status || null,
+          priority: item.priority || null,
+          last_seen_at: item.last_seen_at || null,
+        });
+        acc[item.plan_id] = list;
+        return acc;
+      }, {});
+    }
+    const items = (data || []).map((row) => ({
+      id: row.id,
+      client_id: row.client_id,
+      employee_id: row.employee_id,
+      call_session_id: row.call_session_id,
+      plan: row.plan,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      source_analysis_id: columnExists('coaching_plans', 'source_analysis_id') ? row.source_analysis_id || null : null,
+      duration_minutes: columnExists('coaching_plans', 'duration_minutes') ? row.duration_minutes || null : null,
+      sessions_per_week: columnExists('coaching_plans', 'sessions_per_week') ? row.sessions_per_week || null : null,
+      weeks: columnExists('coaching_plans', 'weeks') ? row.weeks || null : null,
+      last_analysis_at: columnExists('coaching_plans', 'last_analysis_at') ? row.last_analysis_at || null : null,
+      items: planItemsByPlan[row.id] || [],
+    }));
+    return ok(res, { items });
   } catch (e) {
     return sendError(res, 500, { error: 'server_error', detail: e?.message || 'Unexpected error' });
   }
@@ -550,9 +976,15 @@ app.get('/coaching-plans', requireAuth, withClientScope, async (req, res) => {
 
 app.post('/coaching-sessions', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { client_id, employee_id, scheduled_at, duration_minutes, channel, notes, artifacts } = req.body || {};
-    if (!client_id || !employee_id || !scheduled_at) {
-      return sendError(res, 400, { error: 'invalid_payload', detail: 'client_id, employee_id, and scheduled_at are required' });
+    const { client_id, employee_id, scheduled_at, scheduled_for, duration_minutes, channel, notes, artifacts } = req.body || {};
+    const timeField = columnExists('coaching_sessions', 'scheduled_for')
+      ? 'scheduled_for'
+      : columnExists('coaching_sessions', 'scheduled_at')
+      ? 'scheduled_at'
+      : null;
+    const scheduled = scheduled_for || scheduled_at;
+    if (!client_id || !employee_id || !scheduled || !timeField) {
+      return sendError(res, 400, { error: 'invalid_payload', detail: 'client_id, employee_id, and scheduled time are required' });
     }
     if (!hasManagerAccess(req, client_id)) {
       return sendError(res, 403, { error: 'forbidden', detail: 'Insufficient permissions' });
@@ -560,13 +992,13 @@ app.post('/coaching-sessions', requireAuth, withClientScope, async (req, res) =>
     const payload = {
       client_id,
       employee_id,
-      scheduled_at,
+      [timeField]: scheduled,
       duration_minutes: duration_minutes || 45,
-      channel: channel || 'virtual',
       notes: notes || null,
-      artifacts: artifacts || {},
       status: 'scheduled',
     };
+    if (columnExists('coaching_sessions', 'channel')) payload.channel = channel || 'virtual';
+    if (columnExists('coaching_sessions', 'artifacts')) payload.artifacts = artifacts || {};
     const { data, error } = await supabaseAdmin.from('coaching_sessions').insert(payload).select().single();
     if (error) return sendError(res, 500, { error: 'coaching_session_create_failed', detail: error.message, code: error.code, hint: error.hint });
     return ok(res, { item: data });
@@ -579,15 +1011,34 @@ app.get('/coaching-sessions', requireAuth, withClientScope, async (req, res) => 
   try {
     const allowed = resolveClientIds(req, req.query.client_id);
     if (!allowed.length) return ok(res, { items: [] });
-    let query = supabaseAdmin
-      .from('coaching_sessions')
-      .select('id,client_id,employee_id,scheduled_at,duration_minutes,channel,notes,artifacts,status,created_at,updated_at')
-      .in('client_id', allowed)
-      .order('scheduled_at', { ascending: false });
+    const timeField = columnExists('coaching_sessions', 'scheduled_for')
+      ? 'scheduled_for'
+      : columnExists('coaching_sessions', 'scheduled_at')
+      ? 'scheduled_at'
+      : null;
+    const cols = ['id', 'client_id', 'employee_id', 'duration_minutes', 'notes', 'status', 'created_at', 'updated_at'];
+    if (timeField) cols.push(timeField);
+    if (columnExists('coaching_sessions', 'artifacts')) cols.push('artifacts');
+    if (columnExists('coaching_sessions', 'channel')) cols.push('channel');
+    let query = supabaseAdmin.from('coaching_sessions').select(cols.join(',')).in('client_id', allowed);
+    if (timeField) query = query.order(timeField, { ascending: false });
     if (req.query.employee_id) query = query.eq('employee_id', req.query.employee_id);
     const { data, error } = await query;
     if (error) return sendError(res, 500, { error: 'coaching_sessions_fetch_failed', detail: error.message, code: error.code, hint: error.hint });
-    return ok(res, { items: data || [] });
+    const items = (data || []).map((row) => ({
+      id: row.id,
+      client_id: row.client_id,
+      employee_id: row.employee_id,
+      scheduled_at: timeField ? row[timeField] : null,
+      duration_minutes: row.duration_minutes,
+      notes: row.notes || null,
+      artifacts: columnExists('coaching_sessions', 'artifacts') ? row.artifacts || {} : null,
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      channel: columnExists('coaching_sessions', 'channel') ? row.channel || null : null,
+    }));
+    return ok(res, { items });
   } catch (e) {
     return sendError(res, 500, { error: 'server_error', detail: e?.message || 'Unexpected error' });
   }

@@ -11,8 +11,6 @@
   },
   "dependencies": {
     "@sentry/react": "^10.20.0",
-    "@stripe/react-stripe-js": "^2.7.3",
-    "@stripe/stripe-js": "^4.6.0",
     "@supabase/supabase-js": "^2.55.0",
     "axios": "^1.11.0",
     "react": "^19.1.0",

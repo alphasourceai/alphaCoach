@@ -14,6 +14,6 @@ If you are developing a production application, we recommend using TypeScript wi
 
 VITE_BACKEND_URL=http://localhost:3000
 VITE_SUPABASE_URL=
-VITE_SUPABASE_ANON_KEY=
+VITE_SUPABASE_PUBLIC_ANON_KEY=
 
 Providing details for interviewer project:

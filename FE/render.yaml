@@ -1,0 +1,51 @@
+services:
+  # ---- Frontend PROD (single-page dashboard) ----
+  - type: web
+    name: ia-frontend-prod
+    runtime: static
+    branch: prod-single-dashboard
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    headers:
+      - key: Permissions-Policy
+        value: camera=(self "https://tavus.daily.co" "https://*.daily.co"), microphone=(self "https://tavus.daily.co" "https://*.daily.co"), fullscreen=*
+      - key: Feature-Policy
+        value: camera 'self' https://tavus.daily.co https://*.daily.co; microphone 'self' https://tavus.daily.co https://*.daily.co; fullscreen *
+    envVars:
+      - key: VITE_BACKEND_URL
+        value: https://ia-backend-prod.onrender.com
+      # keep these managed in the Render UI; don't let blueprint overwrite
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+
+  # ---- Frontend QA (multipage) ----
+  - type: web
+    name: ia-frontend-qa
+    runtime: static
+    branch: qa-multipage
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_BACKEND_URL
+        value: https://ia-backend-qa.onrender.com
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+
+  # ---- Frontend STAGING (multipage) ----
+  - type: web
+    name: ia-frontend-staging
+    runtime: static
+    branch: staging-multipage
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_BACKEND_URL
+        value: https://ia-backend-staging.onrender.com
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
